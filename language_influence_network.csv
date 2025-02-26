@@ -1,0 +1,16 @@
+Source,Target,InfluenceStrength
+Latin,English,0.9
+Latin,Spanish,0.8
+Greek,Latin,0.85
+Arabic,Persian,0.75
+French,English,0.95
+French,Italian,0.7
+Chinese,Korean,0.85
+Sanskrit,Thai,0.8
+English,Hindi,0.9
+Spanish,Tagalog,0.7
+Portuguese,Brazilian Portuguese,0.85
+Turkish,Azerbaijani,0.8
+Persian,Urdu,0.8
+Japanese,Chinese,0.7
+Russian,Ukrainian,0.75
