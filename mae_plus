@@ -1,0 +1,285 @@
+import os
+import logging
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import BertTokenizer, MarianMTModel, MarianTokenizer  # For translation
+from transformers import GPT2LMHeadModel, GPT2Tokenizer  # For language model
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Hyperparameters and configuration
+config = {
+    'input_csv': '/home/curleyd/GitHub/content_pipeline/tiriki/output.csv',
+    'english_csv': '/home/curleyd/GitHub/content_pipeline/tiriki/english.csv',
+    'output_csv': '/home/curleyd/GitHub/content_pipeline/tiriki/improved_verses.csv',
+    'max_length': 50,
+    'embedding_dim': 128,
+    'latent_dim': 128,
+    'epochs': 1000,
+    'batch_size': 32,
+    'val_split': 0.2,
+    'learning_rate': 1e-4,
+    'mask_prob': 0.3,
+    'error_threshold': 0.1,
+    'early_stopping_patience': 5,
+    'device': torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    'min_train_delta': 1e-4,
+}
+
+### Load Paired CSV Data ###
+def load_paired_csv(input_csv, english_csv):
+    """
+    Load and merge input language and English CSVs based on 'id'.
+    """
+    try:
+        df_input = pd.read_csv(input_csv, header=None, names=['raw'])
+        df_input['id'] = df_input['raw'].str[:8]
+        df_input['text'] = df_input['raw'].str[8:].str.lstrip()
+        
+        df_english = pd.read_csv(english_csv, header=None, names=['raw'])
+        df_english['id'] = df_english['raw'].str[:8]
+        df_english['text'] = df_english['raw'].str[8:].str.lstrip()
+        
+        df_paired = pd.merge(df_input, df_english, on='id', suffixes=('_input', '_english'))
+        return df_paired
+    except Exception as e:
+        logging.error(f"Error loading CSVs: {e}")
+        raise
+
+### Dataset with Masking ###
+class MaskedTextDataset(Dataset):
+    def __init__(self, texts, tokenizer, max_length, mask_prob):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.texts = texts
+        self.mask_prob = mask_prob
+        self.mask_token_id = tokenizer.mask_token_id
+    
+    def __len__(self):
+        return len(self.texts)
+    
+    def __getitem__(self, idx):
+        text = self.texts[idx]
+        encoding = self.tokenizer(
+            text, padding="max_length", truncation=True, max_length=self.max_length, return_tensors="pt"
+        )
+        input_ids = encoding["input_ids"].squeeze(0)
+        masked_input = input_ids.clone()
+        mask = torch.rand(input_ids.shape) < self.mask_prob
+        masked_input[mask] = self.mask_token_id
+        return masked_input, input_ids
+
+### Masked Autoencoder Model ###
+class MaskedAutoencoder(nn.Module):
+    def __init__(self, vocab_size, max_length, embedding_dim, latent_dim):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=embedding_dim, nhead=4, dim_feedforward=latent_dim)
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=2)
+        self.output_layer = nn.Linear(embedding_dim, vocab_size)
+    
+    def forward(self, x):
+        embedded = self.embedding(x).transpose(0, 1)
+        encoded = self.encoder(embedded)
+        decoded = self.decoder(encoded, encoded)
+        logits = self.output_layer(decoded).transpose(0, 1)
+        return logits
+
+### Calculate Reconstruction Error ###
+def calculate_reconstruction_error(model, tokenizer, text, max_length, device):
+    encoding = tokenizer(
+        text, padding="max_length", truncation=True, max_length=max_length, return_tensors="pt"
+    )
+    input_ids = encoding["input_ids"].to(device)
+    model.eval()
+    with torch.no_grad():
+        logits = model(input_ids)
+        probs = F.softmax(logits, dim=-1)
+        predicted_ids = torch.argmax(probs, dim=-1)
+    error = torch.mean((input_ids != predicted_ids).float()).item()
+    return error
+
+### Back-Translation Function ###
+def back_translate(text, model_to_en, tokenizer_to_en, model_to_input, tokenizer_to_input):
+    """
+    Translate text to English and back to the input language.
+    """
+    # To English
+    inputs = tokenizer_to_en(text, return_tensors="pt", padding=True, truncation=True, max_length=config['max_length'])
+    inputs = {k: v.to(config['device']) for k, v in inputs.items()}
+    translated_ids = model_to_en.generate(**inputs)
+    text_en = tokenizer_to_en.decode(translated_ids[0], skip_special_tokens=True)
+    
+    # Back to input language
+    inputs = tokenizer_to_input(text_en, return_tensors="pt", padding=True, truncation=True, max_length=config['max_length'])
+    inputs = {k: v.to(config['device']) for k, v in inputs.items()}
+    back_translated_ids = model_to_input.generate(**inputs)
+    back_text = tokenizer_to_input.decode(back_translated_ids[0], skip_special_tokens=True)
+    return back_text
+
+### Language Model Scoring Function ###
+def score_sentence(text, lm_model, lm_tokenizer):
+    """
+    Compute the log-probability score of a sentence using a language model.
+    """
+    inputs = lm_tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=config['max_length'])
+    inputs = {k: v.to(config['device']) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = lm_model(**inputs, labels=inputs["input_ids"])
+        return -outputs.loss.item()  # Negative loss as higher is better
+
+### Training Function ###
+def train_model(model, train_loader, val_loader, criterion, optimizer, config):
+    best_val_loss = float('inf')
+    best_train_loss = float('inf')
+    patience_counter = 0
+    
+    for epoch in range(config['epochs']):
+        model.train()
+        train_loss = 0
+        for masked_input, target in tqdm(train_loader, desc=f"Epoch {epoch+1}/{config['epochs']}"):
+            masked_input, target = masked_input.to(config['device']), target.to(config['device'])
+            logits = model(masked_input)
+            loss = criterion(logits.reshape(-1, config['vocab_size']), target.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        
+        train_loss_avg = train_loss / len(train_loader)
+        logging.info(f"Epoch {epoch+1} - Train Loss: {train_loss_avg:.6f}")
+        
+        val_loss = evaluate_model(model, val_loader, criterion, config)
+        logging.info(f"Epoch {epoch+1} - Validation Loss: {val_loss:.6f}")
+        
+        val_improved = val_loss < best_val_loss
+        train_improved = (best_train_loss - train_loss_avg) > config['min_train_delta']
+        
+        if val_improved or train_improved:
+            if val_improved:
+                best_val_loss = val_loss
+                torch.save(model.state_dict(), "best_model.pth")
+                logging.info("🔼 New best validation model saved.")
+            if train_improved:
+                best_train_loss = train_loss_avg
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= config['early_stopping_patience']:
+                logging.info("⛔ Early stopping triggered.")
+                break
+
+### Evaluation Function ###
+def evaluate_model(model, val_loader, criterion, config):
+    model.eval()
+    val_loss = 0
+    with torch.no_grad():
+        for masked_input, target in val_loader:
+            masked_input, target = masked_input.to(config['device']), target.to(config['device'])
+            logits = model(masked_input)
+            loss = criterion(logits.reshape(-1, config['vocab_size']), target.reshape(-1))
+            val_loss += loss.item()
+    return val_loss / len(val_loader)
+
+### Improve Text Function ###
+def improve_text(df_paired, model, tokenizer, config, translation_models, lm_models):
+    """
+    Improve text quality using autoencoder, back-translation, and language model scoring.
+    """
+    improved_texts = []
+    model_to_en, tokenizer_to_en = translation_models['to_en']
+    model_to_input, tokenizer_to_input = translation_models['to_input']
+    lm_model, lm_tokenizer = lm_models['lm']
+    
+    for idx, row in tqdm(df_paired.iterrows(), total=len(df_paired), desc="Improving verses"):
+        sentence = row['text_input']
+        error = calculate_reconstruction_error(model, tokenizer, sentence, config['max_length'], config['device'])
+        
+        if error > config['error_threshold']:
+            back_translated = back_translate(sentence, model_to_en, tokenizer_to_en, model_to_input, tokenizer_to_input)
+            lm_original = score_sentence(sentence, lm_model, lm_tokenizer)
+            lm_back = score_sentence(back_translated, lm_model, lm_tokenizer)
+            improved_text = back_translated if lm_back > lm_original else sentence
+        else:
+            improved_text = sentence
+        
+        improved_texts.append({'id': row['id'], 'text_input': sentence, 'text_improved': improved_text, 'error': error})
+    
+    improved_df = pd.DataFrame(improved_texts)
+    improved_df.to_csv(config['output_csv'], index=False)
+    logging.info(f"Saved {len(improved_df)} improved verses to {config['output_csv']}.")
+
+### Placeholder for Training Translation and Language Models ###
+def train_translation_and_lm_models(df_paired):
+    """
+    Placeholder for training translation and language models.
+    """
+    input_texts = df_paired['text_input'].tolist()
+    english_texts = df_paired['text_english'].tolist()
+    
+    # Translation models (example using MarianMT)
+    model_to_en = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-tir-en").to(config['device'])
+    tokenizer_to_en = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-tir-en")
+    model_to_input = MarianMTModel.from_pretrained("Helsinki-NLP/opus-mt-en-tir").to(config['device'])
+    tokenizer_to_input = MarianTokenizer.from_pretrained("Helsinki-NLP/opus-mt-en-tir")
+    
+    # Language model (example using GPT-2)
+    lm_model = GPT2LMHeadModel.from_pretrained("gpt2").to(config['device'])
+    lm_tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    
+    # In practice, fine-tune these models with input_texts and english_texts
+    logging.info("Translation and language models loaded (placeholders).")
+    
+    return {
+        'to_en': (model_to_en, tokenizer_to_en),
+        'to_input': (model_to_input, tokenizer_to_input),
+        'lm': (lm_model, lm_tokenizer)
+    }
+
+### Main Function ###
+def main():
+    logging.info("🚀 Starting training and text improvement...")
+    
+    # Load paired data
+    df_paired = load_paired_csv(config['input_csv'], config['english_csv'])
+    logging.info(f"Loaded {len(df_paired)} paired rows.")
+    
+    # Train or load translation and language models (placeholder)
+    models_dict = train_translation_and_lm_models(df_paired)
+    translation_models = {'to_en': models_dict['to_en'], 'to_input': models_dict['to_input']}
+    lm_models = {'lm': models_dict['lm']}
+    
+    # Initialize tokenizer for autoencoder
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    config['vocab_size'] = tokenizer.vocab_size
+    
+    # Prepare dataset and loaders for autoencoder
+    dataset = MaskedTextDataset(df_paired['text_input'].tolist(), tokenizer, config['max_length'], config['mask_prob'])
+    train_size = int((1 - config['val_split']) * len(dataset))
+    val_size = len(dataset) - train_size
+    train_set, val_set = torch.utils.data.random_split(dataset, [train_size, val_size])
+    train_loader = DataLoader(train_set, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_set, batch_size=config['batch_size'])
+    
+    # Initialize and train autoencoder
+    model = MaskedAutoencoder(config['vocab_size'], config['max_length'], config['embedding_dim'], config['latent_dim']).to(config['device'])
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    optimizer = optim.Adam(model.parameters(), lr=config['learning_rate'])
+    train_model(model, train_loader, val_loader, criterion, optimizer, config)
+    torch.save(model.state_dict(), "masked_autoencoder.pth")
+    logging.info("Autoencoder training complete.")
+    
+    # Improve text and save results
+    improve_text(df_paired, model, tokenizer, config, translation_models, lm_models)
+
+if __name__ == "__main__":
+    main()
