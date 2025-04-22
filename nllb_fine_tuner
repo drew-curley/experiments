@@ -1,0 +1,218 @@
+import os
+import argparse
+from pathlib import Path
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Trainer, TrainingArguments
+import pandas as pd
+from datasets import load_dataset
+import sacrebleu
+
+def preprocess_data(data_dir, output_dir):
+    """
+    Preprocess aligned bitext data from files 41-67 in 'arabic' and 'zrl' subfolders.
+    Splits into train (41-60), dev (61-64), and test (65-67).
+    
+    Args:
+        data_dir: Directory with 'arabic' (1-67) and 'zrl' (41-67) subfolders.
+        output_dir: Directory to save processed data.
+    Returns:
+        Tuple of train, dev, test file paths.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+    
+    train_files = list(range(41, 61))  # 41-60
+    dev_files = list(range(61, 65))    # 61-64
+    test_files = list(range(65, 68))   # 65-67
+    
+    def read_aligned_files(file_numbers, arabic_dir, zrl_dir):
+        data = {"source": [], "target": []}
+        for num in file_numbers:
+            arabic_file = arabic_dir / f"{num}.txt"
+            zrl_file = zrl_dir / f"{num}.txt"
+            if not arabic_file.exists() or not zrl_file.exists():
+                print(f"Warning: Missing file for {num}")
+                continue
+            with open(arabic_file, "r", encoding="utf-8") as src_f, \
+                 open(zrl_file, "r", encoding="utf-8") as tgt_f:
+                src_lines = src_f.readlines()
+                tgt_lines = tgt_f.readlines()
+                if len(src_lines) != len(tgt_lines):
+                    print(f"Warning: Mismatch in file {num}: {len(src_lines)} vs {len(tgt_lines)} lines")
+                    continue
+                for src, tgt in zip(src_lines, tgt_lines):
+                    data["source"].append(src.strip())
+                    data["target"].append(tgt.strip())
+        return data
+    
+    arabic_dir = data_dir / "arabic"
+    zrl_dir = data_dir / "zrl"
+    train_data = read_aligned_files(train_files, arabic_dir, zrl_dir)
+    dev_data = read_aligned_files(dev_files, arabic_dir, zrl_dir)
+    test_data = read_aligned_files(test_files, arabic_dir, zrl_dir)
+    
+    train_file = output_dir / "train.csv"
+    dev_file = output_dir / "dev.csv"
+    test_file = output_dir / "test.csv"
+    
+    pd.DataFrame(train_data).to_csv(train_file, index=False)
+    pd.DataFrame(dev_data).to_csv(dev_file, index=False)
+    pd.DataFrame(test_data).to_csv(test_file, index=False)
+    
+    return train_file, dev_file, test_file
+
+def load_dataset(tokenizer, train_file, dev_file, test_file):
+    """
+    Load and tokenize dataset with language tokens [ara] and [zrl].
+    
+    Args:
+        tokenizer: Pretrained tokenizer.
+        train_file, dev_file, test_file: Paths to CSV files.
+    Returns:
+        Tokenized dataset.
+    """
+    def tokenize_batch(examples):
+        src_texts = ["[ara] " + text for text in examples["source"]]
+        tgt_texts = ["[zrl] " + text for text in examples["target"]]
+        inputs = tokenizer(src_texts, padding="max_length", truncation=True, max_length=128)
+        with tokenizer.as_target_tokenizer():
+            labels = tokenizer(tgt_texts, padding="max_length", truncation=True, max_length=128)
+        inputs["labels"] = labels["input_ids"]
+        return inputs
+
+    dataset = load_dataset("csv", data_files={"train": str(train_file), "dev": str(dev_file), "test": str(test_file)})
+    tokenized_dataset = dataset.map(tokenize_batch, batched=True)
+    return tokenized_dataset
+
+def compute_metrics(eval_preds, tokenizer):
+    """
+    Compute SacreBLEU score for evaluation.
+    
+    Args:
+        eval_preds: Tuple of (predictions, labels) from Trainer.
+        tokenizer: Tokenizer to decode predictions.
+    Returns:
+        Dictionary with SacreBLEU score.
+    """
+    preds, labels = eval_preds
+    # Decode predictions and labels
+    decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+    # Replace -100 in labels (used for padding) with pad_token_id
+    labels = [[l if l != -100 else tokenizer.pad_token_id for l in label] for label in labels]
+    decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+    
+    # Compute SacreBLEU
+    bleu = sacrebleu.corpus_bleu(decoded_preds, [decoded_labels])
+    return {"sacrebleu": bleu.score}
+
+def translate_file(model, tokenizer, input_file, output_file, device):
+    """
+    Translate the input file from Arabic to ZRL and save to output file.
+    Log sample translations for qualitative review.
+    
+    Args:
+        model: Fine-tuned model.
+        tokenizer: Tokenizer with added [zrl] token.
+        input_file: Path to Arabic file 29.
+        output_file: Path to save translated text.
+        device: Device to run model on.
+    """
+    model.eval()
+    with open(input_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+    translations = []
+    print("Sample translations from file 29:")
+    for i, line in enumerate(lines):
+        input_text = "[ara] " + line
+        inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        translated_tokens = model.generate(**inputs, forced_bos_token_id=tokenizer.convert_tokens_to_ids("[zrl]"))
+        translated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+        translations.append(translated_text)
+        # Log first 5 translations for review
+        if i < 5:
+            print(f"Arabic: {line}\nZRL: {translated_text}\n")
+    with open(output_file, "w", encoding="utf-8") as f:
+        for trans in translations:
+            f.write(trans + "\n")
+
+def main(args):
+    # Set up directories
+    data_dir = Path(args.data_dir)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # Preprocess data
+    train_file, dev_file, test_file = preprocess_data(data_dir, output_dir / "processed")
+
+    # Load NLLB model and tokenizer
+    model_name = "facebook/nllb-200-3.3B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Add [zrl] token for the zero-resource language
+    if "[zrl]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens(["[zrl]"])
+    
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.resize_token_embeddings(len(tokenizer))
+    
+    # Move to GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # Load dataset
+    dataset = load_dataset(tokenizer, train_file, dev_file, test_file)
+
+    # Define training arguments
+    training_args = TrainingArguments(
+        output_dir=output_dir / "checkpoints",
+        evaluation_strategy="epoch",
+        learning_rate=args.learning_rate,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        num_train_epochs=args.epochs,
+        weight_decay=0.01,
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        fp16=True if torch.cuda.is_available() else False,
+        metric_for_best_model="sacrebleu",
+        greater_is_better=True,
+    )
+
+    # Initialize trainer with custom metrics
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        eval_dataset=dataset["dev"],
+        tokenizer=tokenizer,
+        compute_metrics=lambda eval_preds: compute_metrics(eval_preds, tokenizer),
+    )
+
+    # Fine-tune model
+    print("Starting fine-tuning...")
+    trainer.train()
+
+    # Save model
+    model.save_pretrained(output_dir / "fine_tuned_model")
+    tokenizer.save_pretrained(output_dir / "fine_tuned_model")
+
+    # Evaluate on test set
+    print("Evaluating on test set...")
+    metrics = trainer.evaluate(dataset["test"])
+    print(f"Test metrics: {metrics}")
+
+    # Translate file 29 from Arabic to ZRL
+    input_file = data_dir / "arabic" / "29.txt"
+    output_file = output_dir / "translated_29.txt"
+    translate_file(model, tokenizer, input_file, output_file, device)
+    print(f"Translation saved to {output_file}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Fine-tune NLLB for Arabic to ZRL translation.")
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory with 'arabic' (1-67) and 'zrl' (41-67) subfolders")
+    parser.add_argument("--output_dir", type=str, default="output", help="Output directory for processed data and model")
+    parser.add_argument("--learning_rate", type=float, default=2e-5, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
+    args = parser.parse_args()
+    main(args)
