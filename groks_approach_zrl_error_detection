@@ -1,0 +1,98 @@
+import nltk
+from nltk import word_tokenize, edit_distance
+from nltk.util import ngrams
+from nltk.lm import Laplace
+from nltk.lm.preprocessing import padded_everygram_pipeline
+import gensim
+from gensim.models import Word2Vec
+from sklearn.cluster import DBSCAN
+import numpy as np
+from collections import Counter
+
+# Sample text (replace with your New Testament text)
+text = """
+In the beginning God created the heaven and the earth.
+And the earth was without form, and void; and darkness was upon the face of the deep.
+And the Spirit of God moved upon the face of the waters.
+And God said, Let there be light: and there was light.
+But there was a typo in this verse: liht instead of light.
+"""
+
+# Split into verses and tokenize
+verses = [v.strip() for v in text.split('\n') if v.strip()]
+tokenized_verses = [word_tokenize(verse.lower()) for verse in verses]
+
+# Language modeling: train trigram model
+all_words = [word for verse in tokenized_verses for word in verse]
+train_data, padded_sents = padded_everygram_pipeline(3, [all_words])
+lm = Laplace(3)
+lm.fit(train_data, padded_sents)
+
+# Word frequencies for spell-checking
+word_freq = Counter(all_words)
+
+# Spell-checking: flag rare words similar to frequent ones
+flagged_words = {}
+for word in word_freq:
+    if word_freq[word] == 1:
+        corrections = [w for w in word_freq if edit_distance(word, w) == 1 and word_freq[w] > word_freq[word]]
+        if corrections:
+            flagged_words[word] = max(corrections, key=lambda w: word_freq[w])
+
+# Perplexity: flag verses above threshold
+perplexities = [lm.perplexity(verse) for verse in tokenized_verses]
+threshold = np.mean(perplexities) + 2 * np.std(perplexities)
+
+# Word embeddings and clustering
+w2v_model = Word2Vec(tokenized_verses, vector_size=100, window=5, min_count=1)
+def get_sentence_embedding(verse_words, model):
+    vectors = [model.wv[word] for word in verse_words if word in model.wv]
+    return np.mean(vectors, axis=0) if vectors else np.zeros(model.vector_size)
+embeddings = [get_sentence_embedding(verse, w2v_model) for verse in tokenized_verses]
+X = np.vstack(embeddings)
+db = DBSCAN(eps=0.5, min_samples=2, metric='cosine').fit(X)
+outlier_indices = [i for i, label in enumerate(db.labels_) if label == -1]
+
+# Phrase consistency: check bigrams
+bigrams = [bg for verse in tokenized_verses for bg in ngrams(verse, 2)]
+bigram_freq = Counter(bigrams)
+frequent_bigrams = [bg for bg, freq in bigram_freq.items() if freq >= 2]
+rare_bigrams = [bg for bg, freq in bigram_freq.items() if freq == 1]
+flagged_bigrams = []
+for rare_bg in rare_bigrams:
+    for freq_bg in frequent_bigrams:
+        if (rare_bg[0] == freq_bg[0] and edit_distance(rare_bg[1], freq_bg[1]) == 1) or \
+           (rare_bg[1] == freq_bg[1] and edit_distance(rare_bg[0], freq_bg[0]) == 1):
+            flagged_bigrams.append((rare_bg, freq_bg))
+
+# Combine flags and report
+flagged_verses = {}
+for i, verse in enumerate(verses):
+    reasons = []
+    verse_words = tokenized_verses[i]
+    # Misspellings
+    misspelled = [w for w in verse_words if w in flagged_words]
+    if misspelled:
+        reasons.append(f"Potential misspellings: {', '.join([f'{w} (suggested: {flagged_words[w]})' for w in misspelled])}")
+    # Inconsistent phrases
+    verse_bigrams = list(ngrams(verse_words, 2))
+    flagged_bg_in_verse = [bg for bg in verse_bigrams if bg in [fb[0] for fb in flagged_bigrams]]
+    if flagged_bg_in_verse:
+        for bg in flagged_bg_in_verse:
+            suggested = [fb[1] for fb in flagged_bigrams if fb[0] == bg][0]
+            reasons.append(f"Inconsistent phrase: {' '.join(bg)} (similar to {' '.join(suggested)})")
+    # High perplexity
+    if perplexities[i] > threshold:
+        reasons.append(f"High perplexity: {perplexities[i]:.2f}")
+    # Outlier
+    if i in outlier_indices:
+        reasons.append("Outlier in clustering")
+    if reasons:
+        flagged_verses[verse] = reasons
+
+# Output results
+print("Potential Issues in the Text:")
+for verse, reasons in flagged_verses.items():
+    print(f"\nVerse: '{verse}'")
+    for reason in reasons:
+        print(f"  - {reason}")
