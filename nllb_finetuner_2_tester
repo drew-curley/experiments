@@ -1,0 +1,152 @@
+import os
+from pathlib import Path
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Trainer, TrainingArguments
+import pandas as pd
+from datasets import load_dataset as hf_load_dataset
+import sacrebleu
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def preprocess_data(data_dir, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    # Load training.csv
+    train_csv = data_dir / "training.csv"
+    if not train_csv.exists():
+        logger.error(f"Training CSV {train_csv} does not exist!")
+        raise FileNotFoundError(f"Training CSV {train_csv} does not exist!")
+    train_df = pd.read_csv(train_csv, header=None)  # Assuming no headers
+    if train_df.shape[1] < 7:  # Need at least 6 columns (0-6, so 7 total)
+        logger.error("Training CSV has fewer than 7 columns!")
+        raise ValueError("Training CSV has fewer than 7 columns!")
+    train_data = train_df.iloc[:, [5, 6]].rename(columns={5: "source", 6: "target"})
+    train_file = output_dir / "train.csv"
+    train_data.to_csv(train_file, index=False)
+    logger.info(f"Saved {len(train_data)} training examples to {train_file}")
+
+    # Load testing.csv
+    test_csv = data_dir / "testing.csv"
+    if not test_csv.exists():
+        logger.error(f"Testing CSV {test_csv} does not exist!")
+        raise FileNotFoundError(f"Testing CSV {test_csv} does not exist!")
+    test_df = pd.read_csv(test_csv, header=None)  # Assuming no headers
+    if test_df.shape[1] < 7:
+        logger.error("Testing CSV has fewer than 7 columns!")
+        raise ValueError("Testing CSV has fewer than 7 columns!")
+    test_data = test_df.iloc[:, [5, 6]].rename(columns={5: "source", 6: "reference"})
+
+    return train_file, test_data
+
+def load_tokenized_dataset(tokenizer, train_file):
+    def tokenize_batch(examples):
+        model_inputs = tokenizer(examples["source"], padding="max_length", truncation=True, max_length=128)
+        labels = tokenizer(examples["target"], padding="max_length", truncation=True, max_length=128)
+        labels["input_ids"] = [
+            [(token if token != tokenizer.pad_token_id else -100) for token in label]
+            for label in labels["input_ids"]
+        ]
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    dataset = hf_load_dataset("csv", data_files={"train": str(train_file)})
+    tokenized_dataset = dataset.map(tokenize_batch, batched=True)
+    return tokenized_dataset
+
+def generate_and_evaluate(model, tokenizer, test_data, device, output_file):
+    model.eval()
+    results = []
+
+    for idx, row in test_data.iterrows():
+        source_text = row["source"]
+        reference = row["reference"]
+        inputs = tokenizer(source_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+        translated_tokens = model.generate(**inputs, max_length=128, forced_bos_token_id=tokenizer.convert_tokens_to_ids("[zrl]"))
+        generated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+
+        bleu = sacrebleu.sentence_bleu(generated_text, [reference])
+
+        print(f"[Test Row {idx+1}] BLEU: {bleu.score:.2f}")
+        results.append({
+            "row": idx+1,
+            "source": source_text,
+            "reference": reference,
+            "generated": generated_text,
+            "bleu_score": bleu.score
+        })
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False)
+
+    avg_bleu = df["bleu_score"].mean()
+    print(f"\nAverage BLEU across all test rows: {avg_bleu:.2f}")
+
+def main():
+    # Hardcoded paths
+    data_dir = Path("/home/drew/Documents/GitHub/NLLB_finetuning/Tiriki/")
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    # Hardcoded hyperparameters
+    learning_rate = 2e-5
+    batch_size = 4
+    epochs = 3
+
+    # Preprocessing
+    train_file, test_data = preprocess_data(data_dir, output_dir / "processed")
+
+    # Load model and tokenizer
+    model_name = "facebook/nllb-200-3.3B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    if "[zrl]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens(["[zrl]"])
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.resize_token_embeddings(len(tokenizer))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # Load and tokenize dataset
+    dataset = load_tokenized_dataset(tokenizer, train_file)
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=str(output_dir / "checkpoints"),
+        evaluation_strategy="no",
+        learning_rate=learning_rate,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        num_train_epochs=epochs,
+        weight_decay=0.01,
+        save_strategy="epoch",
+        logging_dir=str(output_dir / "logs"),
+        logging_steps=50,
+        fp16=torch.cuda.is_available(),
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        tokenizer=tokenizer,
+    )
+
+    logger.info("Starting fine-tuning...")
+    trainer.train()
+
+    model.save_pretrained(output_dir / "fine_tuned_model")
+    tokenizer.save_pretrained(output_dir / "fine_tuned_model")
+
+    # Evaluation
+    logger.info("Starting evaluation on test data...")
+    output_eval_file = output_dir / "test_evaluation.csv"
+    generate_and_evaluate(model, tokenizer, test_data, device, output_eval_file)
+
+if __name__ == "__main__":
+    main()
