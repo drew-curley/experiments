@@ -1,1 +1,169 @@
+import os
+from pathlib import Path
+import torch
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, Trainer, TrainingArguments
+import pandas as pd
+from datasets import load_dataset as hf_load_dataset
+import sacrebleu
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def preprocess_data(data_dir, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
+
+    train_files = list(range(41, 58)) + list(range(59, 66)) + [67]
+    heldout_files = [58, 66]
+
+    def read_files(file_numbers, dir_path):
+        verses = []
+        for num in file_numbers:
+            file_path = dir_path / f"{num}.txt"
+            if not file_path.exists():
+                logger.warning(f"Missing file: {file_path}")
+                continue
+            with open(file_path, "r", encoding="utf-8") as f:
+                verses += [line.strip() for line in f if line.strip()]
+        logger.info(f"Read {len(verses)} verses from {dir_path} for files {file_numbers}")
+        return verses
+
+    zrl_dir = data_dir / "zrl"
+    train_verses = read_files(train_files, zrl_dir)
+    if not train_verses:
+        logger.error("No training verses found! Check input files.")
+        raise ValueError("No training verses found!")
+
+    test_verses = {}
+    for num in heldout_files:
+        file_path = zrl_dir / f"{num}.txt"
+        if file_path.exists():
+            with open(file_path, "r", encoding="utf-8") as f:
+                test_verses[num] = [line.strip() for line in f if line.strip()]
+        else:
+            logger.warning(f"Missing heldout file: {file_path}")
+
+    train_data = {
+        "source": ["[zrl] generate:" for _ in train_verses],
+        "target": train_verses
+    }
+
+    train_file = output_dir / "train.csv"
+    pd.DataFrame(train_data).to_csv(train_file, index=False)
+
+    return train_file, test_verses
+
+def load_tokenized_dataset(tokenizer, train_file):
+    def tokenize_batch(examples):
+        model_inputs = tokenizer(examples["source"], padding="max_length", truncation=True, max_length=128)
+        labels = tokenizer(examples["target"], padding="max_length", truncation=True, max_length=128)
+        labels["input_ids"] = [
+            [(token if token != tokenizer.pad_token_id else -100) for token in label]
+            for label in labels["input_ids"]
+        ]
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    dataset = hf_load_dataset("csv", data_files={"train": str(train_file)})
+    tokenized_dataset = dataset.map(tokenize_batch, batched=True)
+    return tokenized_dataset
+
+def generate_and_evaluate(model, tokenizer, test_verses, device, output_file):
+    model.eval()
+    results = []
+
+    for file_num, verses in test_verses.items():
+        logger.info(f"Evaluating on held-out file {file_num}...")
+        for idx, reference in enumerate(verses):
+            input_text = "[zrl] generate:"
+            inputs = tokenizer(input_text, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
+            translated_tokens = model.generate(**inputs, max_length=128)
+            generated_text = tokenizer.decode(translated_tokens[0], skip_special_tokens=True)
+
+            bleu = sacrebleu.sentence_bleu(generated_text, [reference])
+
+            print(f"[File {file_num} - Verse {idx+1}] BLEU: {bleu.score:.2f}")
+            results.append({
+                "file": file_num,
+                "verse_index": idx+1,
+                "reference": reference,
+                "generated": generated_text,
+                "bleu_score": bleu.score
+            })
+
+    df = pd.DataFrame(results)
+    df.to_csv(output_file, index=False)
+
+    avg_bleu = df["bleu_score"].mean()
+    print(f"\nAverage BLEU across all held-out verses: {avg_bleu:.2f}")
+
+def main():
+    # Hardcoded paths
+    data_dir = Path("/home/drew/Documents/GitHub/NLLB_finetuning/Tiriki/")
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    # Hardcoded hyperparameters
+    learning_rate = 2e-5
+    batch_size = 4
+    epochs = 3
+
+    # Preprocessing
+    train_file, test_verses = preprocess_data(data_dir, output_dir / "processed")
+
+    # Load model and tokenizer
+    model_name = "facebook/nllb-200-3.3B"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    if "[zrl]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens(["[zrl]"])
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.resize_token_embeddings(len(tokenizer))
+
+    model.config.forced_bos_token_id = tokenizer.convert_tokens_to_ids("[zrl]")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # Load and tokenize dataset
+    dataset = load_tokenized_dataset(tokenizer, train_file)
+
+    # Training arguments
+    training_args = TrainingArguments(
+        output_dir=str(output_dir / "checkpoints"),
+        evaluation_strategy="no",
+        learning_rate=learning_rate,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        num_train_epochs=epochs,
+        weight_decay=0.01,
+        save_strategy="epoch",
+        logging_dir=str(output_dir / "logs"),
+        logging_steps=50,
+        fp16=torch.cuda.is_available(),
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset["train"],
+        tokenizer=tokenizer,
+    )
+
+    logger.info("Starting fine-tuning...")
+    trainer.train()
+
+    model.save_pretrained(output_dir / "fine_tuned_model")
+    tokenizer.save_pretrained(output_dir / "fine_tuned_model")
+
+    # Evaluation
+    logger.info("Starting evaluation on held-out verses...")
+    output_eval_file = output_dir / "heldout_evaluation.csv"
+    generate_and_evaluate(model, tokenizer, test_verses, device, output_eval_file)
+
+if __name__ == "__main__":
+    main()
 
