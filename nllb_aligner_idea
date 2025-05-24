@@ -1,0 +1,202 @@
+#!/usr/bin/env python
+# train_and_align_zero.py
+# Fine-tune NLLB on bitexts, including zero-resource targets, and dump word alignments.
+
+# ───────────────────────── 1. Imports & CLI ──────────────────────────
+import argparse, os, math, json, csv, collections, itertools, gc, torch
+import pandas as pd
+from tqdm import tqdm
+from datasets import Dataset
+from transformers import (
+    AutoTokenizer, AutoModelForSeq2SeqLM,
+    Seq2SeqTrainingArguments, Seq2SeqTrainer, DataCollatorForSeq2Seq
+)
+
+# ───────────────────────── 1.1  Command line ─────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--csv",        required=True,
+                    help="Path to bitexts.csv (E=source, F=target)")
+parser.add_argument("--src_lang",   required=True,
+                    help="e.g. deu_Latn  (NLLB language id for column E)")
+parser.add_argument("--tgt_lang",   required=True,
+                    help="e.g. gon_Latn  (can be new / zero-resource)")
+parser.add_argument("--model_name",
+                    default="facebook/nllb-200-distilled-600M")
+parser.add_argument("--out_dir",    default="fine_tuned_nllb")
+parser.add_argument("--epochs",     type=int, default=3)
+parser.add_argument("--batch",      type=int, default=4)
+parser.add_argument("--align_thr",  type=float, default=0.05,
+                    help="probability ≥ thr → keep; else 'x'")
+args = parser.parse_args()
+
+ALIGN_THR = args.align_thr          # used later in alignment dump
+device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ──────────────────────── 2. Load & preprocess ───────────────────────
+print("Reading bitext …")
+df        = pd.read_csv(args.csv, usecols=[4, 5], header=0, nrows=8000)
+df.columns = ["src", "tgt"]         # E→src, F→tgt
+
+tok = AutoTokenizer.from_pretrained(args.model_name, use_fast=True)
+
+# ───── 2.1  Zero-resource set-up  ────────────────────────────────────
+def ensure_lang_token(lang_code: str):
+    """
+    If lang_code does not exist in the tokenizer, create <<lang_code>>
+    as an additional special token and return its id.
+    """
+    if lang_code in tok.lang_code_to_id:
+        return tok.lang_code_to_id[lang_code]
+
+    # Create new special token
+    new_token = f"<<{lang_code}>>"
+    print(f"✧ Adding zero-resource language token {new_token}")
+    tok.add_special_tokens({"additional_special_tokens": [new_token]})
+    tok.lang_code_to_id[lang_code] = tok.convert_tokens_to_ids(new_token)
+    return tok.lang_code_to_id[lang_code]
+
+# register source & target languages
+tok.src_lang = args.src_lang
+tgt_bos_id   = ensure_lang_token(args.tgt_lang)
+
+# ───────────────────────── 3. Build / resize model ───────────────────
+print("Loading model …")
+model = AutoModelForSeq2SeqLM.from_pretrained(
+            args.model_name,
+            output_attentions=True,
+       )
+# If we added tokens, grow embedding tables
+if len(tok) != model.get_input_embeddings().weight.size(0):
+    model.resize_token_embeddings(len(tok))
+    print(f"✧ Resized embeddings to {len(tok)} entries")
+
+# Force decoder BOS
+model.config.forced_bos_token_id = tgt_bos_id
+
+# ───── 3.1  Check UNK rate on the zero-resource side (info only) ─────
+with torch.no_grad():
+    enc = tok(df["tgt"].tolist(), add_special_tokens=False)
+    total_tok  = sum(len(ids) for ids in enc["input_ids"])
+    unk_tok    = sum(ids.count(tok.unk_token_id) for ids in enc["input_ids"])
+    print(f"UNK rate in target text: {unk_tok/total_tok:.2%}")
+
+# ───────────────────── 4. Encode dataset & token counts ──────────────
+def _encode(batch):
+    return tok(batch["src"],
+               text_target=batch["tgt"],
+               truncation=True,
+               padding=False)
+
+ds   = Dataset.from_pandas(df)
+ds   = ds.map(_encode, remove_columns=["src", "tgt"])
+
+# Build token-frequency tables for balanced loss
+freq_tgt = collections.Counter()
+for ex in tqdm(ds, desc="Counting target tokens"):
+    freq_tgt.update([t for t in ex["labels"] if t != -100])
+
+def inv_freq_weight(idx, pow=0.5):
+    """weight ∝ 1/√freq   (idx may be UNK or a new token)"""
+    return 1.0 / (freq_tgt.get(idx, 1) ** pow)
+
+# ───────────────────── 5. Loss & data-collator ───────────────────────
+def compute_loss(model, inputs, return_outputs=False):
+    out      = model(**inputs)
+    logits   = out.logits
+    labels   = inputs["labels"]
+
+    loss_fct = torch.nn.CrossEntropyLoss(reduction='none')
+    vocab_sz = logits.size(-1)
+    loss_tok = loss_fct(logits.view(-1, vocab_sz), labels.view(-1))
+
+    with torch.no_grad():
+        weights = torch.tensor([inv_freq_weight(i)
+                                for i in labels.view(-1).tolist()],
+                               device=loss_tok.device)
+    loss = (loss_tok * weights).mean()
+    return (loss, out) if return_outputs else loss
+
+data_collator = DataCollatorForSeq2Seq(tok, model=model)
+
+# ───────────────────── 6. TrainingArguments ──────────────────────────
+training_args = Seq2SeqTrainingArguments(
+    output_dir      = args.out_dir,
+    num_train_epochs= args.epochs,
+    per_device_train_batch_size = args.batch,
+    save_strategy  = "epoch",
+    learning_rate  = 5e-5,
+    fp16           = torch.cuda.is_available(),
+    report_to      = "none",
+)
+
+# ───── 6.1  Two-tier learning-rate: new target embeddings ×2 ─────────
+# Split parameters into two groups
+emb_name = "model.decoder.embed_tokens.weight"
+fast_params, base_params = [], []
+for n, p in model.named_parameters():
+    if n == emb_name:
+        fast_params.append(p)
+    else:
+        base_params.append(p)
+
+optimizer = torch.optim.AdamW(
+    [
+        {"params": base_params},
+        {"params": fast_params, "lr": training_args.learning_rate * 2.0},
+    ],
+    lr=training_args.learning_rate,
+    betas=(0.9, 0.999),
+    weight_decay=0.01,
+)
+# ───────────────────────── 7. Trainer ────────────────────────────────
+trainer = Seq2SeqTrainer(
+    model           = model,
+    args            = training_args,
+    train_dataset   = ds,
+    data_collator   = data_collator,
+    tokenizer       = tok,
+    compute_loss    = compute_loss,
+    optimizers      = (optimizer, None),  # None = use Trainer's default scheduler
+)
+
+print("Fine-tuning …")
+trainer.train()
+trainer.save_model(args.out_dir)
+tok.save_pretrained(args.out_dir)
+print("✓ Model saved to", args.out_dir)
+
+# ─────────────────── 8. Alignment extraction pass ────────────────────
+model.to(device).eval()
+
+def extract_one(src_sent, tgt_sent):
+    batch = tok(src_sent,
+                text_target=tgt_sent,
+                return_tensors="pt",
+                truncation=True).to(device)
+    with torch.no_grad():
+        out   = model(**batch)
+        cross = out.cross_attentions[0]         # first decoder layer
+        att   = cross.mean(dim=1).squeeze(0)    # average heads
+        prob  = att.softmax(dim=-1).cpu()       # norm over src
+    src_tok = tok.convert_ids_to_tokens(batch["input_ids"][0])
+    tgt_tok = tok.convert_ids_to_tokens(batch["labels"][0])
+    return src_tok, tgt_tok, prob.T             # src × tgt
+
+print("Computing alignments …")
+os.makedirs("align_csv", exist_ok=True)
+for idx, (src, tgt) in tqdm(list(enumerate(zip(df.src, df.tgt), 1)),
+                            total=len(df), desc="Rows"):
+    s_tok, t_tok, mat = extract_one(src, tgt)
+    with open(f"align_csv/row{idx:05}.csv", "w", newline='', encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([""] + t_tok)
+        for i, s in enumerate(s_tok):
+            row = [s]
+            for j in range(len(t_tok)):
+                p = mat[i, j].item()
+                row.append("" if p < ALIGN_THR else f"{p:.3f}")
+            writer.writerow(row)
+    if idx % 50 == 0:
+        gc.collect(); torch.cuda.empty_cache()
+
+print("✅ All done!  Per-sentence alignment CSVs are in ./align_csv/")
