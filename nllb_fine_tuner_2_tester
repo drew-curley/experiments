@@ -78,7 +78,7 @@ def load_and_tokenize(tokenizer, file_path, src_col, tgt_col, max_length=128, ba
     return DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=True)
 
 def evaluate_and_save(model, tokenizer, eval_file, src_col, ref_col, output_path, device):
-    # Load evaluation bitext
+    # Load evaluation CSV
     try:
         df = pd.read_csv(eval_file)
         logger.info(f"Loaded evaluation CSV with columns: {list(df.columns)}")
@@ -86,46 +86,72 @@ def evaluate_and_save(model, tokenizer, eval_file, src_col, ref_col, output_path
         logger.error(f"Failed to load evaluation CSV {eval_file}: {str(e)}")
         return
 
-    # Validate column indices
+    # Check column indices
     if src_col >= len(df.columns) or ref_col >= len(df.columns):
         logger.error(f"Invalid column indices: src_col={src_col}, ref_col={ref_col}, but CSV has {len(df.columns)} columns")
         return
 
     generated_texts = []
     bleu_scores = []
+
     model.eval()
 
-    for _, row in df.iterrows():
+    for i, row in df.iterrows():
         input_text = str(row.iloc[src_col]) if pd.notnull(row.iloc[src_col]) else ''
+
         if not input_text.strip():
-            logger.warning(f"Skipping empty input at row {row.name}")
+            logger.warning(f"[{i}] Skipping empty input.")
             generated_texts.append('')
             bleu_scores.append(0.0)
             continue
 
-        logger.debug(f"Evaluating input: {input_text}")
-        inputs = tokenizer(input_text, return_tensors='pt',
-                          padding=True, truncation=True, max_length=128)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            out = model.generate(**inputs, max_length=128)
-        gen = tokenizer.decode(out[0], skip_special_tokens=True)
-        ref = str(row.iloc[ref_col]) if pd.notnull(row.iloc[ref_col]) else ''
-        
-        bleu = sacrebleu.sentence_bleu(gen, [ref]).score if ref.strip() else 0.0
+        try:
+            logger.debug(f"[{i}] Input text: {input_text}")
 
-        generated_texts.append(gen)
+            inputs = tokenizer(
+                input_text,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=128
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_length=128,
+                    num_beams=5,
+                    early_stopping=True
+                )
+
+            logger.debug(f"[{i}] Generated token IDs: {output_ids}")
+            generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+
+        except Exception as e:
+            logger.error(f"[{i}] Error during generation: {str(e)}")
+            generated = ''
+
+        reference = str(row.iloc[ref_col]) if pd.notnull(row.iloc[ref_col]) else ''
+        bleu = sacrebleu.sentence_bleu(generated, [reference]).score if reference.strip() else 0.0
+
+        logger.info(f"[{i}]")
+        logger.info(f"SRC: {input_text}")
+        logger.info(f"GEN: {generated}")
+        logger.info(f"REF: {reference}")
+        logger.info(f"BLEU: {bleu:.2f}\n---")
+
+        generated_texts.append(generated)
         bleu_scores.append(bleu)
-        logger.info(f"Source: {input_text}\nGen: {gen}\nRef: {ref}\nBLEU: {bleu:.2f}\n---")
 
-    # Append new columns and save
     df['generated_zrl'] = generated_texts
     df['bleu_score'] = bleu_scores
+
     try:
         df.to_csv(output_path, index=False)
-        logger.info(f"Saved evaluation results to {output_path}")
+        logger.info(f"Evaluation results saved to: {output_path}")
     except Exception as e:
-        logger.error(f"Failed to save evaluation results: {str(e)}")
+        logger.error(f"Failed to save results to CSV: {str(e)}")
 
 def main():
     # Check versions
