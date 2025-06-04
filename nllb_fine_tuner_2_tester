@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 import torch
 import pandas as pd
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, EncoderDecoderCache
 from datasets import Dataset
 import sacrebleu
 import logging
@@ -78,6 +78,8 @@ def load_and_tokenize(tokenizer, file_path, src_col, tgt_col, max_length=128, ba
     return DataLoader(tokenized_dataset, batch_size=batch_size, shuffle=True)
 
 def evaluate_and_save(model, tokenizer, eval_file, src_col, ref_col, output_path, device):
+    from transformers import EncoderDecoderCache
+
     # Load evaluation CSV
     try:
         df = pd.read_csv(eval_file)
@@ -128,6 +130,26 @@ def evaluate_and_save(model, tokenizer, eval_file, src_col, ref_col, output_path
             logger.debug(f"[{i}] Generated token IDs: {output_ids}")
             generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
+        except TypeError as e:
+            # Patch deprecated past_key_values if necessary
+            if "past_key_values" in str(e):
+                logger.warning(f"[{i}] Switching to EncoderDecoderCache for past_key_values.")
+                past_kv = kwargs.get("past_key_values")
+                if isinstance(past_kv, tuple):
+                    kwargs["past_key_values"] = EncoderDecoderCache.from_legacy_cache(past_kv)
+                # Retry generation with patched cache
+                with torch.no_grad():
+                    output_ids = model.generate(
+                        **inputs,
+                        max_length=128,
+                        num_beams=5,
+                        early_stopping=True
+                    )
+                generated = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+            else:
+                logger.error(f"[{i}] Generation error: {str(e)}")
+                generated = ''
+
         except Exception as e:
             logger.error(f"[{i}] Error during generation: {str(e)}")
             generated = ''
@@ -153,6 +175,7 @@ def evaluate_and_save(model, tokenizer, eval_file, src_col, ref_col, output_path
     except Exception as e:
         logger.error(f"Failed to save results to CSV: {str(e)}")
 
+
 def main():
     # Check versions
     try:
@@ -167,9 +190,9 @@ def main():
 
     # Paths and filenames
     data_dir = Path(".")
-    train_file = Path(r"C:\Users\dcurl\OneDrive\Desktop\experiments\input_text.csv")
-    eval_file = Path(r"C:\Users\dcurl\OneDrive\Desktop\experiments\eval_text.csv")
-    output_dir = Path(r"C:\Users\dcurl\OneDrive\Desktop\experiments\output")
+    train_file = Path(r"C:\Users\dcurl\Desktop\Test\input_text.csv")
+    eval_file = Path(r"C:\Users\dcurl\Desktop\Test\eval_text.csv")
+    output_dir = Path(r"C:\Users\dcurl\Desktop\Test\output")
     output_dir.mkdir(exist_ok=True)
 
     # Model and tokenizer
@@ -211,29 +234,73 @@ def main():
         logger.error("Failed to create training dataloader")
         return
 
-    # Training setup
+        # Training setup
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    num_epochs = 3
+    num_epochs = 10
     logging_steps = 50
-    total_steps = len(train_dataloader) * num_epochs
     step = 0
+    best_val_loss = float('inf')
+    patience = 2
+    patience_counter = 0
 
-    # Training loop
-    logger.info("Starting fine-tuning...")
+    # Split dataset for validation
+    train_size = int(0.9 * len(train_dataloader.dataset))
+    val_size = len(train_dataloader.dataset) - train_size
+    train_subset, val_subset = torch.utils.data.random_split(train_dataloader.dataset, [train_size, val_size])
+    train_loader = DataLoader(train_subset, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_subset, batch_size=4)
+
+    total_steps = len(train_loader) * num_epochs
+    scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.01, total_iters=total_steps)
+
+    logger.info("Starting fine-tuning with validation...")
+
     model.train()
     for epoch in range(num_epochs):
-        for batch in train_dataloader:
+        total_loss = 0.0
+        for batch in train_loader:
             inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
             labels = batch['labels'].to(device)
             outputs = model(**inputs, labels=labels)
             loss = outputs.loss
             loss.backward()
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
 
             step += 1
+            total_loss += loss.item()
+
             if step % logging_steps == 0:
-                logger.info(f"Epoch {epoch+1}/{num_epochs}, Step {step}/{total_steps}, Loss: {loss.item():.4f}")
+                avg_loss = total_loss / logging_steps
+                logger.info(f"Epoch {epoch+1}/{num_epochs}, Step {step}/{total_steps}, Loss: {avg_loss:.4f}")
+                total_loss = 0.0
+
+        # --- Validation phase ---
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_loader:
+                inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
+                labels = batch['labels'].to(device)
+                outputs = model(**inputs, labels=labels)
+                val_loss += outputs.loss.item()
+
+        val_loss /= len(val_loader)
+        logger.info(f"Validation Loss after Epoch {epoch+1}: {val_loss:.4f}")
+        model.train()
+
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            logger.info("Validation loss improved — keeping model.")
+        else:
+            patience_counter += 1
+            logger.info(f"No improvement in validation loss (patience {patience_counter}/{patience})")
+            if patience_counter >= patience:
+                logger.info("Early stopping triggered.")
+                break
 
     # Save model
     try:
