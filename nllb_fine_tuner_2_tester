@@ -263,6 +263,7 @@ def main():
             labels = batch['labels'].to(device)
             outputs = model(**inputs, labels=labels)
             loss = outputs.loss
+            print(torch.cuda.memory_summary())
             loss.backward()
             optimizer.step()
             scheduler.step()
