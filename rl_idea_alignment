@@ -1,0 +1,169 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import pandas as pd
+from collections import defaultdict
+
+# Load and preprocess the CSV file
+def load_bitexts(file_path):
+    df = pd.read_csv(file_path, header=None)  # Assuming no header
+    bitexts = list(zip(df[3], df[4]))  # Columns 4 and 5 (0-indexed: 3 and 4)
+    return [(s.split(), t.split()) for s, t in bitexts]  # Split into words
+
+# Compute translation probabilities using co-occurrence
+def compute_translation_probs(bitexts):
+    src_counts = defaultdict(int)
+    pair_counts = defaultdict(int)
+    for src_words, tgt_words in bitexts:
+        for s in src_words:
+            src_counts[s] += 1
+            for t in tgt_words:
+                pair_counts[(s, t)] += 1
+    probs = {}
+    for (s, t), count in pair_counts.items():
+        probs[(s, t)] = count / src_counts[s]
+    return probs
+
+# Policy network using a simple feedforward NN with embeddings
+class PolicyNetwork(nn.Module):
+    def __init__(self, src_vocab_size, tgt_vocab_size, embed_dim=64):
+        super(PolicyNetwork, self).__init__()
+        self.src_embed = nn.Embedding(src_vocab_size, embed_dim)
+        self.tgt_embed = nn.Embedding(tgt_vocab_size, embed_dim)
+        self.fc = nn.Linear(embed_dim * 2, tgt_vocab_size + 1)  # +1 for null
+
+    def forward(self, src_word_idx, tgt_words_idx, prev_alignments):
+        src_emb = self.src_embed(src_word_idx)
+        # Average target embeddings for context
+        tgt_emb = self.tgt_embed(tgt_words_idx).mean(dim=0).unsqueeze(0)
+        combined = torch.cat((src_emb, tgt_emb), dim=-1)
+        logits = self.fc(combined)
+        return torch.softmax(logits, dim=-1)
+
+# RL environment for alignment
+class AlignmentEnv:
+    def __init__(self, src_words, tgt_words, trans_probs):
+        self.src_words = src_words
+        self.tgt_words = tgt_words
+        self.trans_probs = trans_probs
+        self.alignments = {}
+        self.src_used = set()
+        self.tgt_used = set()
+        self.step_idx = 0
+
+    def reset(self):
+        self.alignments = {}
+        self.src_used = set()
+        self.tgt_used = set()
+        self.step_idx = 0
+        return self.get_state()
+
+    def get_state(self):
+        return (self.src_words[self.step_idx], self.tgt_words, self.alignments)
+
+    def step(self, action):
+        src_idx = self.step_idx
+        tgt_idx = action if action < len(self.tgt_words) else None  # None for null
+        self.alignments[src_idx] = tgt_idx
+        if tgt_idx is not None:
+            self.src_used.add(src_idx)
+            self.tgt_used.add(tgt_idx)
+        self.step_idx += 1
+        done = self.step_idx >= len(self.src_words)
+        reward = self.compute_reward() if done else 0
+        next_state = self.get_state() if not done else None
+        return next_state, reward, done
+
+    def compute_reward(self):
+        score = 0
+        penalty = 0
+        tgt_counts = defaultdict(int)
+        for src_idx, tgt_idx in self.alignments.items():
+            if tgt_idx is not None:
+                s = self.src_words[src_idx]
+                t = self.tgt_words[tgt_idx]
+                score += np.log(self.trans_probs.get((s, t), 1e-6))
+                tgt_counts[tgt_idx] += 1
+        # Penalty for non-one-to-one alignments
+        penalty = sum(max(0, c - 1) for c in tgt_counts.values())
+        return score - 0.1 * penalty  # Lambda = 0.1
+
+# Training function
+def train_rl(bitexts, trans_probs, src_vocab, tgt_vocab, epochs=10):
+    src_vocab_size = len(src_vocab)
+    tgt_vocab_size = len(tgt_vocab)
+    policy = PolicyNetwork(src_vocab_size, tgt_vocab_size)
+    optimizer = optim.Adam(policy.parameters(), lr=0.001)
+
+    for epoch in range(epochs):
+        total_reward = 0
+        for src_words, tgt_words in bitexts:
+            env = AlignmentEnv(src_words, tgt_words, trans_probs)
+            state = env.reset()
+            log_probs = []
+            rewards = []
+
+            while True:
+                src_word, tgt_words, _ = state
+                src_idx = torch.tensor([src_vocab[src_word]], dtype=torch.long)
+                tgt_idx = torch.tensor([tgt_vocab.get(t, 0) for t in tgt_words] + [tgt_vocab_size], dtype=torch.long)
+                probs = policy(src_idx, tgt_idx, env.alignments)
+                action = torch.multinomial(probs, 1).item()
+                next_state, reward, done = env.step(action)
+                log_probs.append(torch.log(probs[0, action]))
+                rewards.append(reward)
+                if done:
+                    break
+                state = next_state
+
+            # Update policy with REINFORCE
+            R = rewards[-1]  # Final reward
+            total_reward += R
+            loss = -sum(lp * R for lp in log_probs)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch + 1}, Avg Reward: {total_reward / len(bitexts):.4f}")
+    return policy
+
+# Generate alignment for a bitext
+def generate_alignment(policy, src_words, tgt_words, src_vocab, tgt_vocab):
+    env = AlignmentEnv(src_words, tgt_words, trans_probs)
+    state = env.reset()
+    alignment = []
+    while True:
+        src_word, tgt_words, _ = state
+        src_idx = torch.tensor([src_vocab[src_word]], dtype=torch.long)
+        tgt_idx = torch.tensor([tgt_vocab.get(t, 0) for t in tgt_words] + [len(tgt_vocab)], dtype=torch.long)
+        probs = policy(src_idx, tgt_idx, env.alignments)
+        action = torch.argmax(probs).item()
+        next_state, _, done = env.step(action)
+        alignment.append((src_words[env.step_idx - 1], tgt_words[action] if action < len(tgt_words) else "NULL"))
+        if done:
+            break
+        state = next_state
+    return alignment
+
+# Main execution
+if __name__ == "__main__":
+    # Load data
+    file_path = "bitexts.csv"  # Replace with your CSV file path
+    bitexts = load_bitexts(file_path)
+    print(f"Loaded {len(bitexts)} bitexts")
+
+    # Build vocabularies
+    src_vocab = {word: idx for idx, word in enumerate(set(w for s, _ in bitexts for w in s))}
+    tgt_vocab = {word: idx for idx, word in enumerate(set(w for _, t in bitexts for w in t))}
+    trans_probs = compute_translation_probs(bitexts)
+
+    # Train the model
+    policy = train_rl(bitexts, trans_probs, src_vocab, tgt_vocab, epochs=10)
+
+    # Generate alignment for the first bitext
+    first_src, first_tgt = bitexts[0]
+    alignment = generate_alignment(policy, first_src, first_tgt, src_vocab, tgt_vocab)
+    print("\nAlignment for the first bitext:")
+    for src_word, tgt_word in alignment:
+        print(f"{src_word} -> {tgt_word}")
