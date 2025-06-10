@@ -1,0 +1,226 @@
+import os
+import logging
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Trainer, TrainingArguments
+from datasets import Dataset
+import pandas as pd
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Define constants
+BASE_DIR = "/home/curleyd/GitHub/New"
+TRAIN_FILE = os.path.join(BASE_DIR, "input_text.csv")
+EVAL_FILE = os.path.join(BASE_DIR, "eval_text.csv")
+OUTPUT_DIR = os.path.join(BASE_DIR, "trained_model")
+EVAL_OUTPUT_CSV = os.path.join(BASE_DIR, "eval_with_translations_run_1.csv")
+
+MODEL_NAME = "facebook/nllb-200-1.3B"
+MAX_LENGTH = 128
+
+# Load model and tokenizer
+def load_model_and_tokenizer():
+    logger.info(f"Loading model and tokenizer: {MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, device_map="auto")
+    return tokenizer, model
+
+# Load datasets
+def load_datasets(train_file, eval_file):
+    try:
+        df_train = pd.read_csv(train_file, encoding="utf-8")
+        df_eval = pd.read_csv(eval_file, encoding="utf-8")
+    except UnicodeDecodeError:
+        logger.warning("UTF-8 failed, falling back to ISO-8859-1")
+        df_train = pd.read_csv(train_file, encoding="ISO-8859-1")
+        df_eval = pd.read_csv(eval_file, encoding="ISO-8859-1")
+
+    logger.info(f"Train columns: {df_train.columns}")
+    logger.info(f"Eval columns: {df_eval.columns}")
+
+    # Check for required columns
+    if 'source' not in df_train.columns or 'target' not in df_train.columns:
+        raise ValueError("Train CSV must have 'source' and 'target' columns")
+    if 'source' not in df_eval.columns or 'target' not in df_eval.columns:
+        raise ValueError("Eval CSV must have 'source' and 'target' columns")
+
+    # Drop rows with missing source or target
+    df_train = df_train.dropna(subset=["source", "target"])
+    df_eval = df_eval.dropna(subset=["source", "target"])
+
+    # Create HuggingFace datasets and filter non-string fields
+    train_ds = Dataset.from_pandas(df_train)
+    eval_ds = Dataset.from_pandas(df_eval)
+    train_ds = train_ds.filter(lambda ex: isinstance(ex.get("source"), str) and isinstance(ex.get("target"), str))
+    eval_ds = eval_ds.filter(lambda ex: isinstance(ex.get("source"), str) and isinstance(ex.get("target"), str))
+    return train_ds, eval_ds
+
+# Compute BLEU
+def compute_bleu_scores(references, hypotheses):
+    smooth = SmoothingFunction().method1
+    scores = [sentence_bleu([ref.split()], hyp.split(), smoothing_function=smooth)
+              for ref, hyp in zip(references, hypotheses)]
+    return scores
+
+# Save model manually
+def save_model(model, tokenizer, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    model.save_pretrained(output_dir, safe_serialization=True)
+    tokenizer.save_pretrained(output_dir)
+
+# Tokenize function factory
+def get_tokenize_function(tokenizer, max_length, src_lang="eng_Latn"):
+    def tokenize_function(examples):
+        filtered_sources = []
+        filtered_targets = []
+        for s, t in zip(examples['source'], examples['target']):
+            if isinstance(s, str) and isinstance(t, str):
+                filtered_sources.append(s)
+                filtered_targets.append(t)
+        if not filtered_sources:
+            return {}
+        try:
+            tokenizer.src_lang = src_lang  # Set the source language for NLLB
+            model_inputs = tokenizer(
+                filtered_sources,
+                max_length=max_length,
+                padding='max_length',
+                truncation=True
+            )
+            labels = tokenizer(
+                filtered_targets,
+                max_length=max_length,
+                padding='max_length',
+                truncation=True
+            )
+            model_inputs['labels'] = labels['input_ids']
+            return model_inputs
+        except Exception as e:
+            logger.error(f"Tokenization failed for filtered batch: {e}")
+            return {}
+    return tokenize_function
+
+# Main training routine
+def run_training():
+    logger.info("\U0001F680 Starting training run")
+
+    tokenizer, model = load_model_and_tokenizer()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    model.to(device)
+
+    train_dataset, eval_dataset = load_datasets(TRAIN_FILE, EVAL_FILE)
+
+    logger.info(f"Original train dataset size: {len(train_dataset)}")
+    logger.info(f"Original eval dataset size: {len(eval_dataset)}")
+    logger.info(f"First 5 train sources: {train_dataset['source'][:5]}")
+    logger.info(f"First 5 train targets: {train_dataset['target'][:5]}")
+    logger.info(f"First 5 eval sources: {eval_dataset['source'][:5]}")
+    logger.info(f"First 5 eval targets: {eval_dataset['target'][:5]}")
+    logger.info("Tokenizing datasets")
+    # Set correct src_lang for your data (no tgt_lang since zrl is not in NLLB)
+    tokenize_function = get_tokenize_function(tokenizer, MAX_LENGTH, src_lang="eng_Latn")
+    train_tokenized = train_dataset.map(
+        tokenize_function,
+        batched=True,
+        batch_size=512,
+        num_proc=1,
+        remove_columns=train_dataset.column_names
+    )
+    eval_tokenized = eval_dataset.map(
+        tokenize_function,
+        batched=True,
+        batch_size=512,
+        num_proc=1,
+        remove_columns=eval_dataset.column_names
+    )
+
+    logger.info(f"Tokenized train dataset size: {len(train_tokenized)}")
+    logger.info(f"Tokenized eval dataset size: {len(eval_tokenized)}")
+    if len(train_tokenized) == 0:
+        logger.error("Tokenized train dataset is empty! Showing first 5 rows of original train dataset:")
+        logger.error(train_dataset[:5])
+    if len(eval_tokenized) == 0:
+        logger.error("Tokenized eval dataset is empty! Showing first 5 rows of original eval dataset:")
+        logger.error(eval_dataset[:5])
+
+    training_args = TrainingArguments(
+        output_dir=OUTPUT_DIR,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        num_train_epochs=1,
+        logging_dir=os.path.join(OUTPUT_DIR, "logs"),
+        logging_steps=10,
+        save_total_limit=1,
+        remove_unused_columns=False
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_tokenized,
+        eval_dataset=eval_tokenized
+    )
+
+    logger.info("Starting training")
+    trainer.train()
+    trainer.evaluate()
+
+    logger.info("Generating translations")
+    sources = eval_dataset["source"]
+    targets = eval_dataset["target"]
+    generated = []
+
+    for s in sources:
+        inputs = tokenizer(s, return_tensors="pt", padding=True, truncation=True).to(device)
+        output = model.generate(**inputs, max_length=200)
+        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        generated.append(generated_text)
+
+    bleu_scores = compute_bleu_scores(targets, generated)
+
+    for i, score in enumerate(bleu_scores):
+        logger.info(f"Row {i+1} BLEU score: {score:.4f}")
+
+    logger.info(f"Average BLEU score: {sum(bleu_scores)/len(bleu_scores):.4f}")
+
+    # Load original eval file to pull from specific columns
+    eval_df = pd.read_csv(EVAL_FILE, encoding="ISO-8859-1")
+
+    # Assume column 5 = source, column 6 = target
+    source_col = eval_df.columns[4]
+    target_col = eval_df.columns[5]
+
+    sources = eval_df[source_col].astype(str).tolist()
+    targets = eval_df[target_col].astype(str).tolist()
+
+    # Run generation again using cleaned sources
+    generated = []
+    for s in sources:
+        inputs = tokenizer(s, return_tensors="pt", padding=True, truncation=True).to(device)
+        output = model.generate(**inputs, max_length=200)
+        generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+        generated.append(generated_text)
+
+    # Compute BLEU scores
+    bleu_scores = compute_bleu_scores(targets, generated)
+
+    # Add generated output and BLEU scores to dataframe
+    eval_df["generated"] = generated
+    eval_df["bleu"] = bleu_scores
+
+    # Save updated eval results
+    eval_df.to_csv(EVAL_OUTPUT_CSV, index=False)
+    logger.info(f"Updated eval dataset with BLEU saved to {EVAL_OUTPUT_CSV}")
+    logger.info(f"Updated eval dataset saved to {EVAL_OUTPUT_CSV}")
+    logger.info(f"Saving model to {OUTPUT_DIR}")
+    save_model(model, tokenizer, OUTPUT_DIR)
+
+if __name__ == "__main__":
+    try:
+        run_training()
+    except Exception as e:
+        logger.error(f"Main execution failed: {e}")
